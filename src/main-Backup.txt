@@ -6,8 +6,8 @@
 #include <DNSServer.h>
 
 // Konfigurasi Access Point
-const char* ssid = "Kijang1";
-const char* password = "password1";  // Minimal 8 karakter untuk WPA2
+const char* ssid = "VisitorCounter";
+const char* password = "12345678";  // Minimal 8 karakter untuk WPA2
 
 // DNS Server untuk captive portal
 const byte DNS_PORT = 53;
@@ -17,10 +17,10 @@ WebServer server(80);
 
 // Konfigurasi LCD dan sensor
 LiquidCrystal_I2C lcd(0x27,20,4);
-const int echoPinA = 14;
-const int trigPinA = 27;
-const int echoPinB = 26;
-const int trigPinB = 25;
+const int trigPinA = 14;
+const int echoPinA = 27;
+const int trigPinB = 26;
+const int echoPinB = 25;
 
 // Variabel counting
 int countIn = 0;
@@ -31,7 +31,7 @@ int currentVisitor = 0;
 const int detectionThreshold = 30;     // Jarak deteksi dalam cm
 const int consecutiveReadings = 2;     // Jumlah pembacaan berturut-turut untuk konfirmasi
 const int sensorTimeout = 1000;        // Timeout untuk menunggu sensor kedua (ms)
-const int debounceDelay = 250;         // Delay minimum antara deteksi (ms)
+const int debounceDelay = 500;         // Delay minimum antara deteksi (ms)
 
 // Status sensor
 bool sensorAState = false;
@@ -210,6 +210,7 @@ void setupServer() {
   Serial.print("AP IP address: ");
   Serial.println(WiFi.softAPIP());
 }
+
 
 void setup() {
   // Setup pin sensor

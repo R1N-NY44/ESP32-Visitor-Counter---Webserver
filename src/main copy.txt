@@ -1,0 +1,557 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <EEPROM.h>
+#include <ArduinoJson.h>
+
+// EEPROM Size dan Address
+#define EEPROM_SIZE 512
+#define COUNTS_ADDR 0
+#define SETTINGS_ADDR 100
+
+// Konfigurasi Access Point
+const char* ssid = "VisitorCounter";
+const char* password = "12345678";
+
+// DNS Server untuk captive portal
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+DNSServer dnsServer;
+WebServer server(80);
+
+// Konfigurasi LCD dan sensor
+LiquidCrystal_I2C lcd(0x27,20,4);
+const int trigPinA = 14;
+const int echoPinA = 27;
+const int trigPinB = 26;
+const int echoPinB = 25;
+
+// Variabel counting dengan struktur untuk EEPROM
+struct CountData {
+  int countIn;
+  int countOut;
+  int currentVisitor;
+} countData;
+
+// Struktur untuk pengaturan sensor
+struct SensorSettings {
+  int detectionThreshold;
+  int consecutiveReadings;
+  int sensorTimeout;
+  int debounceDelay;
+} settings;
+
+// Status sensor
+bool sensorAState = false;
+bool sensorBState = false;
+unsigned long lastDetectionTime = 0;
+int* bufferA;
+int* bufferB;
+
+// HTML template dengan tambahan slider controls
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visitor Counter System</title>
+  <style>
+    body { 
+      font-family: Arial; 
+      text-align: center; 
+      margin: 0;
+      padding: 20px;
+      background-color: #f0f0f0;
+    }
+    .card {
+      background-color: white;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+      margin: 10px auto;
+      max-width: 400px;
+    }
+    .value {
+      font-size: 30px;
+      font-weight: bold;
+      color: #0066cc;
+    }
+    .label {
+      font-size: 16px;
+      color: #666;
+    }
+    .sensor-data {
+      font-size: 14px;
+      color: #888;
+      margin-top: 20px;
+    }
+    .settings {
+      text-align: left;
+      padding: 20px;
+      background: white;
+      border-radius: 10px;
+      margin: 20px auto;
+      max-width: 400px;
+    }
+    .slider-container {
+      margin: 15px 0;
+    }
+    .slider {
+      width: 100%;
+      margin: 10px 0;
+    }
+    .button {
+      background-color: #0066cc;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin: 10px;
+    }
+    .button:hover {
+      background-color: #0052a3;
+    }
+  </style>
+  <script>
+    function updateSettings() {
+      var settings = {
+        detectionThreshold: document.getElementById('threshold').value,
+        consecutiveReadings: document.getElementById('readings').value,
+        sensorTimeout: document.getElementById('timeout').value,
+        debounceDelay: document.getElementById('debounce').value
+      };
+      
+      fetch('/settings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(settings)
+      }).then(response => {
+        if(response.ok) alert('Settings updated successfully!');
+      });
+    }
+
+    function resetCounts() {
+      if(confirm('Are you sure you want to reset all counts?')) {
+        fetch('/reset', {
+          method: 'POST'
+        }).then(response => {
+          if(response.ok) location.reload();
+        });
+      }
+    }
+
+    function updateData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById("countIn").innerHTML = data.in;
+          document.getElementById("countOut").innerHTML = data.out;
+          document.getElementById("current").innerHTML = data.current;
+          document.getElementById("sensorA").innerHTML = data.distanceA;
+          document.getElementById("sensorB").innerHTML = data.distanceB;
+        });
+    }
+
+    // Load initial settings
+    fetch('/settings')
+      .then(response => response.json())
+      .then(settings => {
+        document.getElementById('threshold').value = settings.detectionThreshold;
+        document.getElementById('readings').value = settings.consecutiveReadings;
+        document.getElementById('timeout').value = settings.sensorTimeout;
+        document.getElementById('debounce').value = settings.debounceDelay;
+      });
+
+    setInterval(updateData, 1000);
+  </script>
+</head>
+<body>
+  <h2>Visitor Counter System</h2>
+  
+  <div class="card">
+    <div class="label">Masuk</div>
+    <div class="value" id="countIn">0</div>
+  </div>
+  
+  <div class="card">
+    <div class="label">Keluar</div>
+    <div class="value" id="countOut">0</div>
+  </div>
+  
+  <div class="card">
+    <div class="label">Pengunjung Saat Ini</div>
+    <div class="value" id="current">0</div>
+  </div>
+
+  <div class="sensor-data">
+    <p>Sensor A: <span id="sensorA">0</span> cm</p>
+    <p>Sensor B: <span id="sensorB">0</span> cm</p>
+  </div>
+
+  <div class="settings">
+    <h3>Sensor Settings</h3>
+    
+    <div class="slider-container">
+      <label>Detection Threshold (cm)</label>
+      <input type="range" id="threshold" min="5" max="50" class="slider">
+      <span id="threshold-value"></span>
+    </div>
+
+    <div class="slider-container">
+      <label>Consecutive Readings</label>
+      <input type="range" id="readings" min="1" max="10" class="slider">
+      <span id="readings-value"></span>
+    </div>
+
+    <div class="slider-container">
+      <label>Sensor Timeout (ms)</label>
+      <input type="range" id="timeout" min="500" max="3000" step="100" class="slider">
+      <span id="timeout-value"></span>
+    </div>
+
+    <div class="slider-container">
+      <label>Debounce Delay (ms)</label>
+      <input type="range" id="debounce" min="100" max="1000" step="50" class="slider">
+      <span id="debounce-value"></span>
+    </div>
+
+    <button class="button" onclick="updateSettings()">Save Settings</button>
+    <button class="button" onclick="resetCounts()">Reset Counts</button>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// Fungsi untuk menyimpan data counting ke EEPROM
+void saveCountData() {
+  EEPROM.put(COUNTS_ADDR, countData);
+  EEPROM.commit();
+}
+
+// Fungsi untuk menyimpan pengaturan sensor ke EEPROM
+void saveSettings() {
+  EEPROM.put(SETTINGS_ADDR, settings);
+  EEPROM.commit();
+}
+
+// Fungsi untuk membaca data counting dari EEPROM
+void loadCountData() {
+  EEPROM.get(COUNTS_ADDR, countData);
+}
+
+// Fungsi untuk membaca pengaturan sensor dari EEPROM
+void loadSettings() {
+  EEPROM.get(SETTINGS_ADDR, settings);
+  // Set default values jika belum ada data
+  if(settings.detectionThreshold == 0) {
+    settings.detectionThreshold = 10;
+    settings.consecutiveReadings = 3;
+    settings.sensorTimeout = 1000;
+    settings.debounceDelay = 500;
+    saveSettings();
+  }
+}
+
+// Handler untuk endpoint settings
+void handleSettings() {
+  if (server.method() == HTTP_GET) {
+    String json = "{";
+    json += "\"detectionThreshold\":" + String(settings.detectionThreshold) + ",";
+    json += "\"consecutiveReadings\":" + String(settings.consecutiveReadings) + ",";
+    json += "\"sensorTimeout\":" + String(settings.sensorTimeout) + ",";
+    json += "\"debounceDelay\":" + String(settings.debounceDelay);
+    json += "}";
+    server.send(200, "application/json", json);
+  } 
+  else if (server.method() == HTTP_POST) {
+    String jsonString = server.arg("plain");
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, jsonString);
+    
+    if (error) {
+      server.send(400, "text/plain", "Invalid JSON");
+      return;
+    }
+
+    settings.detectionThreshold = doc["detectionThreshold"] | settings.detectionThreshold;
+    settings.consecutiveReadings = doc["consecutiveReadings"] | settings.consecutiveReadings;
+    settings.sensorTimeout = doc["sensorTimeout"] | settings.sensorTimeout;
+    settings.debounceDelay = doc["debounceDelay"] | settings.debounceDelay;
+    
+    // Realokasi buffer jika consecutive readings berubah
+    delete[] bufferA;
+    delete[] bufferB;
+    bufferA = new int[settings.consecutiveReadings];
+    bufferB = new int[settings.consecutiveReadings];
+    memset(bufferA, 0, settings.consecutiveReadings * sizeof(int));
+    memset(bufferB, 0, settings.consecutiveReadings * sizeof(int));
+    
+    saveSettings();
+    server.send(200, "text/plain", "Settings updated");
+  }
+}
+
+// Handler untuk reset counts
+void handleReset() {
+  countData = {0, 0, 0};
+  saveCountData();
+  server.send(200, "text/plain", "Counts reset");
+}
+
+// ======================== [Kode berikutnya sama dengan kode sebelumnya] ========================
+// Fungsi untuk membaca jarak dari sensor ultrasonik dengan filter noise
+long readDistance(int trigPin, int echoPin) {
+  // Lakukan 3 pembacaan cepat dan ambil rata-rata
+  long total = 0;
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    long duration = pulseIn(echoPin, HIGH, 23529); // Timeout untuk jarak maksimal 4 meter
+    if (duration == 0) return 400; // Return nilai maksimal jika timeout
+    
+    total += duration * 0.034 / 2;
+    delay(10); // Delay kecil antara pembacaan
+  }
+  return total / 3;
+}
+
+// Fungsi untuk mengecek apakah sensor mendeteksi objek dengan konsisten
+bool isObjectDetected(int buffer[], long newReading) {
+  // Geser nilai dalam buffer
+  for(int i = 0; i < consecutiveReadings-1; i++) {
+    buffer[i] = buffer[i+1];
+  }
+  buffer[consecutiveReadings-1] = (newReading < detectionThreshold) ? 1 : 0;
+  
+  // Cek apakah semua pembacaan menunjukkan deteksi
+  int sum = 0;
+  for(int i = 0; i < consecutiveReadings; i++) {
+    sum += buffer[i];
+  }
+  return sum >= consecutiveReadings-1; // Toleransi 1 pembacaan gagal
+}
+
+// Handler untuk root path
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+// Handler untuk data JSON
+void handleData() {
+  long distanceA = readDistance(trigPinA, echoPinA);
+  long distanceB = readDistance(trigPinB, echoPinB);
+  
+  String json = "{";
+  json += "\"in\":" + String(countIn) + ",";
+  json += "\"out\":" + String(countOut) + ",";
+  json += "\"current\":" + String(currentVisitor) + ",";
+  json += "\"distanceA\":" + String(distanceA) + ",";
+  json += "\"distanceB\":" + String(distanceB);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// Handler untuk halaman tidak ditemukan
+void handleNotFound() {
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+// Setup web server
+void setupServer() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid, password);
+
+  // DNS Server untuk redirect semua request ke ESP32
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // Route handler
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  Serial.println("HTTP server started");
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+// ======================== [Kode berikutnya sama dengan kode sebelumnya] ========================
+// [... Sisanya sama dengan kode sebelumnya, dengan penggantian variabel statis menjadi referensi ke struct settings ...]
+
+void setup() {
+  // Inisialisasi EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Load data dan settings
+  loadCountData();
+  loadSettings();
+  
+  // Alokasi buffer
+  bufferA = new int[settings.consecutiveReadings];
+  bufferB = new int[settings.consecutiveReadings];
+  memset(bufferA, 0, settings.consecutiveReadings * sizeof(int));
+  memset(bufferB, 0, settings.consecutiveReadings * sizeof(int));
+  
+  // Setup hardware
+  pinMode(trigPinA, OUTPUT);
+  pinMode(echoPinA, INPUT);
+  pinMode(trigPinB, OUTPUT);
+  pinMode(echoPinB, INPUT);
+
+  Serial.begin(115200);
+  
+  // Inisialisasi LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Loading...");
+
+  // Setup Web Server
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid, password);
+  
+  // DNS Server
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // Route handlers
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", index_html);
+  });
+  server.on("/settings", handleSettings);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/data", HTTP_GET, []() {
+    String json = "{";
+    json += "\"in\":" + String(countData.countIn) + ",";
+    json += "\"out\":" + String(countData.countOut) + ",";
+    json += "\"current\":" + String(countData.currentVisitor) + ",";
+    json += "\"distanceA\":" + String(readDistance(trigPinA, echoPinA)) + ",";
+    json += "\"distanceB\":" + String(readDistance(trigPinB, echoPinB));
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.onNotFound([]() {
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+  });
+  
+  server.begin();
+  
+  lcd.clear();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  // Sensor logic dengan menggunakan settings struct
+  // [... sama seperti sebelumnya, tapi menggunakan settings.detectionThreshold, dll ...]
+  // ======================== [Kode berikutnya sama dengan kode sebelumnya] ========================
+  // Baca jarak dari kedua sensor
+  long distanceA = readDistance(trigPinA, echoPinA);
+  long distanceB = readDistance(trigPinB, echoPinB);
+
+  // Update LCD dengan jarak
+  lcd.setCursor(0, 0);
+  lcd.print("A:");
+  lcd.print(distanceA);
+  lcd.print("cm ");
+  lcd.print("B:");
+  lcd.print(distanceB);
+  lcd.print("cm    ");
+
+  // Cek waktu debounce
+  if (millis() - lastDetectionTime < debounceDelay) {
+    return;
+  }
+
+  // Deteksi status sensor dengan filter
+  bool newSensorAState = isObjectDetected(bufferA, distanceA);
+  bool newSensorBState = isObjectDetected(bufferB, distanceB);
+
+  // State machine untuk mendeteksi arah
+  static enum {IDLE, A_ACTIVE, B_ACTIVE} state = IDLE;
+  static unsigned long stateTimer = 0;
+
+  switch(state) {
+    case IDLE:
+      if (newSensorAState && !newSensorBState) {
+        state = A_ACTIVE;
+        stateTimer = millis();
+      }
+      else if (newSensorBState && !newSensorAState) {
+        state = B_ACTIVE;
+        stateTimer = millis();
+      }
+      break;
+
+    case A_ACTIVE:
+      if (newSensorBState) {
+        if (millis() - stateTimer < sensorTimeout) {
+          countIn++;
+          currentVisitor++;
+          Serial.println("IN: " + String(countIn));
+          lastDetectionTime = millis();
+        }
+        state = IDLE;
+      }
+      else if (millis() - stateTimer > sensorTimeout) {
+        state = IDLE;
+      }
+      break;
+
+    case B_ACTIVE:
+      if (newSensorAState) {
+        if (millis() - stateTimer < sensorTimeout) {
+          countOut++;
+          currentVisitor = max(0, currentVisitor - 1);
+          Serial.println("OUT: " + String(countOut));
+          lastDetectionTime = millis();
+        }
+        state = IDLE;
+      }
+      else if (millis() - stateTimer > sensorTimeout) {
+        state = IDLE;
+      }
+      break;
+  }
+
+  // Update LCD
+  lcd.setCursor(0, 1);
+  lcd.print("I:");
+  lcd.print(countIn);
+  lcd.print(" O:");
+  lcd.print(countOut);
+  lcd.print(" C:");
+  lcd.print(currentVisitor);
+  lcd.print("   ");
+
+  // Delay kecil untuk stabilitas dan mencegah watchdog reset
+  delay(50);
+  
+  // ======================== [Kode berikutnya sama dengan kode sebelumnya] ========================
+  
+  // Save data setiap ada perubahan
+  static int lastCountIn = -1;
+  static int lastCountOut = -1;
+  if (lastCountIn != countData.countIn || lastCountOut != countData.countOut) {
+    saveCountData();
+    lastCountIn = countData.countIn;
+    lastCountOut = countData.countOut;
+  }
+  
+  delay(50);
+}

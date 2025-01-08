@@ -1,0 +1,71 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HardwareSerial.h>
+
+// Konfigurasi LCD
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Konfigurasi Serial untuk sensor US-100
+HardwareSerial SensorA(1); // UART1
+
+// Pin untuk US-100
+const int SENSOR_RX = 27; // ESP32 RX (kabel TX dari sensor)
+const int SENSOR_TX = 14; // ESP32 TX (kabel RX dari sensor)
+
+void setup() {
+  // Inisialisasi Serial untuk debugging
+  Serial.begin(115200);
+  
+  // Inisialisasi LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("US-100 Test");
+  
+  // Inisialisasi Serial untuk US-100
+  SensorA.begin(9600, SERIAL_8N1, SENSOR_RX, SENSOR_TX);
+
+  delay(1000);
+}
+
+void loop() {
+  // Kirim command pengukuran ke US-100
+  uint8_t command[] = {0x55};
+  SensorA.write(command, sizeof(command));
+  
+  // Clear line kedua LCD
+  lcd.setCursor(0, 1);
+  lcd.print("                    "); // 20 spasi
+  
+  // Baca response
+  if (SensorA.available() >= 2) { // US-100 mengirimkan 2 byte data
+    uint8_t data[2];
+    SensorA.readBytes(data, 2);
+    
+    // Hitung jarak
+    long distance = (data[0] << 8) | data[1]; // Kombinasi 2 byte menjadi jarak
+    if (distance < 0 || distance > 500) {
+      // Data tidak valid
+      lcd.setCursor(0, 1);
+      lcd.print("Invalid data");
+    } else {
+      // Tampilkan di LCD
+      lcd.setCursor(0, 1);
+      lcd.print("Distance: ");
+      lcd.print(distance);
+      lcd.print(" cm");
+      
+      // Debug di Serial
+      Serial.print("Distance: ");
+      Serial.print(distance);
+      Serial.println(" cm");
+    }
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print("No data");
+  }
+
+  delay(500); // Tunggu 500 ms sebelum pengukuran berikutnya
+}
